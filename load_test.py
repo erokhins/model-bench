@@ -74,13 +74,17 @@ ea commodi consequatur? Quis autem vel eum iure reprehenderit qui in ea
 voluptate velit esse quam nihil molestiae consequatur.
 """
 
-PROMPT = (
-    "Please write a detailed essay of approximately 2000 words "
-    "about the history and impact of artificial intelligence on "
-    "modern society, covering topics such as machine learning, "
-    "natural language processing, computer vision, robotics, and "
-    "the ethical implications of AI development."
-)
+DEFAULT_ESSAY_WORDS = 2000
+
+
+def build_prompt(essay_words: int = DEFAULT_ESSAY_WORDS) -> str:
+    return (
+        f"Please write a detailed essay of approximately {essay_words} words "
+        "about the history and impact of artificial intelligence on "
+        "modern society, covering topics such as machine learning, "
+        "natural language processing, computer vision, robotics, and "
+        "the ethical implications of AI development."
+    )
 
 
 def generate_context(target_tokens: int = 30_000) -> str:
@@ -104,20 +108,22 @@ def send_request(
     max_tokens: int,
     extra_body: dict,
     api_type: str = "OpenAICompletion",
+    essay_words: int = DEFAULT_ESSAY_WORDS,
 ) -> dict:
-    input_tokens = len(f"{context}\n\n{PROMPT}") // 4
+    prompt = build_prompt(essay_words)
+    input_tokens = len(f"{context}\n\n{prompt}") // 4
     start = time.monotonic()
 
     try:
         if api_type == "OpenAIResponses":
             result = _send_responses_api(
                 base_url, model, context, api_key, temperature, max_tokens,
-                extra_body, start
+                extra_body, start, prompt
             )
         else:
             result = _send_completion_api(
                 base_url, model, context, api_key, temperature, max_tokens,
-                extra_body, start
+                extra_body, start, prompt
             )
     except Exception as e:
         return {"error": str(e)}
@@ -128,10 +134,10 @@ def send_request(
 
 
 def _send_completion_api(
-    base_url, model, context, api_key, temperature, max_tokens, extra_body, start
+    base_url, model, context, api_key, temperature, max_tokens, extra_body, start, prompt
 ) -> dict:
     """Standard OpenAI /chat/completions with SSE streaming."""
-    messages = [{"role": "user", "content": f"{context}\n\n{PROMPT}"}]
+    messages = [{"role": "user", "content": f"{context}\n\n{prompt}"}]
     body = {
         "model": model,
         "messages": messages,
@@ -205,10 +211,10 @@ def _send_completion_api(
 
 
 def _send_responses_api(
-    base_url, model, context, api_key, temperature, max_tokens, extra_body, start
+    base_url, model, context, api_key, temperature, max_tokens, extra_body, start, prompt
 ) -> dict:
     """OpenAI /responses API with streaming."""
-    input_text = f"{context}\n\n{PROMPT}"
+    input_text = f"{context}\n\n{prompt}"
     body = {
         "model": model,
         "input": input_text,
@@ -514,6 +520,7 @@ def run_ui(stdscr) -> None:
     num_runs = 5
     context_tokens = 30_000
     max_tokens = 4096
+    essay_words = DEFAULT_ESSAY_WORDS
 
     params = [
         ("API Key", api_key, str),
@@ -522,6 +529,7 @@ def run_ui(stdscr) -> None:
         ("Batches", num_runs, int),
         ("Context Tokens", context_tokens, int),
         ("Max Gen Tokens", max_tokens, int),
+        ("Essay Words", essay_words, int),
     ]
 
     sel = 0
@@ -567,6 +575,7 @@ def run_ui(stdscr) -> None:
             num_runs = params[3][1]
             context_tokens = params[4][1]
             max_tokens = params[5][1]
+            essay_words = params[6][1]
 
     # --- Step 3: Run load test ---
     curses.endwin()
@@ -579,7 +588,7 @@ def run_ui(stdscr) -> None:
     print(f"Load Test: {model_id}")
     print(f"URL:       {base_url}")
     print(f"Concurrency: {concurrency}  |  Batches: {num_runs}  |  Context: ~{context_tokens:,} tokens")
-    print(f"Temperature: {temperature}  |  Max gen: {max_tokens}")
+    print(f"Temperature: {temperature}  |  Max gen: {max_tokens}  |  Essay words: {essay_words}")
     print("=" * 78)
     sys.stdout.flush()
 
@@ -597,7 +606,7 @@ def run_ui(stdscr) -> None:
 
         def do_req(req_id, ctx):
             return (req_id, send_request(
-                base_url, model_id, ctx, api_key, temperature, max_tokens, extra_body, api_type
+                base_url, model_id, ctx, api_key, temperature, max_tokens, extra_body, api_type, essay_words
             ))
 
         batch_results = []
