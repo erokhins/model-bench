@@ -146,6 +146,7 @@ def _send_completion_api(
     first_tok = None
     last_tok = None
     tok_count = 0
+    max_gen_tokens = max_tokens
 
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -157,7 +158,7 @@ def _send_completion_api(
         req.add_header("Authorization", f"Bearer {api_key}")
 
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=3600) as resp:
             debug_count = 0
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -180,6 +181,8 @@ def _send_completion_api(
                         first_tok = now
                     last_tok = now
                     tok_count += max(1, len(content) // 4)
+                    if tok_count >= max_gen_tokens:
+                        break
                 elif debug_count < 3:
                     print(f"  [DEBUG chunk] keys={list(chunk.keys())} choices_empty={not choices}")
                     debug_count += 1
@@ -219,6 +222,7 @@ def _send_responses_api(
     first_tok = None
     last_tok = None
     tok_count = 0
+    max_gen_tokens = max_tokens
 
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -230,7 +234,7 @@ def _send_responses_api(
         req.add_header("Authorization", f"Bearer {api_key}")
 
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=3600) as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line or not line.startswith("data:"):
@@ -256,6 +260,8 @@ def _send_responses_api(
                             first_tok = now
                         last_tok = now
                         tok_count += max(1, len(text) // 4)
+                        if tok_count >= max_gen_tokens:
+                            break
                 elif event_type == "response.text.delta":
                     text = event.get("delta", "")
                     if text:
@@ -264,6 +270,8 @@ def _send_responses_api(
                             first_tok = now
                         last_tok = now
                         tok_count += max(1, len(text) // 4)
+                        if tok_count >= max_gen_tokens:
+                            break
                 elif event_type == "response.output_item.delta":
                     delta = event.get("delta", "")
                     if isinstance(delta, str) and delta:
@@ -272,6 +280,8 @@ def _send_responses_api(
                             first_tok = now
                         last_tok = now
                         tok_count += max(1, len(delta) // 4)
+                        if tok_count >= max_gen_tokens:
+                            break
                     elif isinstance(delta, dict):
                         # delta may be a dict with content field
                         for v in delta.values():
@@ -281,6 +291,8 @@ def _send_responses_api(
                                     first_tok = now
                                 last_tok = now
                                 tok_count += max(1, len(v) // 4)
+                                if tok_count >= max_gen_tokens:
+                                    break
                                 break
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:200]
@@ -594,7 +606,7 @@ def run_ui(stdscr) -> None:
                 pool.submit(do_req, batch * concurrency + i + 1, ctx)
                 for i, ctx in enumerate(contexts)
             ]
-            for fut in as_completed(futures, timeout=600):
+            for fut in as_completed(futures, timeout=7200):
                 try:
                     req_id, result = fut.result()
                     batch_results.append((req_id, result))
