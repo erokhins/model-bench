@@ -261,7 +261,7 @@ def _send_completion_api(
                 except json.JSONDecodeError:
                     continue
                 if done:
-                    continue
+                    break
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
@@ -351,7 +351,7 @@ def _send_responses_api(
                     break
 
                 if done:
-                    continue
+                    break
 
                 # OpenAI Responses API: text content arrives in these event types
                 if event_type == "response.output_text.delta":
