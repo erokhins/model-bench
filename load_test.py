@@ -6,7 +6,8 @@ Loads model endpoint configs from ~/.junie-local/models/*.json,
 presents a curses-based menu to pick an endpoint and tune parameters,
 then runs concurrent load tests and prints statistics.
 
-Uses only Python stdlib (urllib, curses, concurrent.futures).
+Uses Python stdlib (urllib, curses, concurrent.futures) plus
+transformers (optional, for accurate token counting via HuggingFace tokenizers).
 
 Usage:
     python load_test.py
@@ -22,6 +23,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from glob import glob
 from typing import Optional
+
+try:
+    from transformers import AutoTokenizer
+    HAS_TOKENIZER = True
+except ImportError:
+    HAS_TOKENIZER = False
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +49,67 @@ def load_model_configs() -> list:
         except Exception as e:
             print(f"Warning: could not load {path}: {e}")
     return configs
+
+
+# ---------------------------------------------------------------------------
+# Tokenizer
+# ---------------------------------------------------------------------------
+
+# Cache for tokenizers keyed by base model family
+_tokenizer_cache: dict = {}
+
+
+def _get_tokenizer_for_model(model_id: str):
+    """Return a HuggingFace tokenizer for the given model, with caching.
+    
+    Falls back to char/4 estimation if transformers is not available
+    or the tokenizer cannot be loaded.
+    """
+    if not HAS_TOKENIZER:
+        return None
+    
+    # Normalize model ID to find the base tokenizer
+    # e.g. "mlx-community/Qwen3.6-27B-8bit" -> try "Qwen/Qwen2.5-32B" as fallback
+    normalized = model_id.lower().replace("-", "").replace("_", "")
+    
+    # Check cache first
+    if normalized in _tokenizer_cache:
+        return _tokenizer_cache[normalized]
+    
+    # Try loading the tokenizer for the exact model ID first
+    tokenizer = None
+    candidates = [model_id]
+    
+    # Map known model families to their tokenizer sources
+    if "qwen3" in normalized or "qwen2" in normalized:
+        # Qwen3.6 uses Qwen2Tokenizer (verified: Qwen/Qwen3.6-27B tokenizer_config.json
+        # declares tokenizer_class=Qwen2Tokenizer). Qwen2.5 tokenizer is identical
+        # in token counts and much lighter/faster to download.
+        candidates.append("Qwen/Qwen2.5-32B")
+    elif "llama" in normalized:
+        candidates.append("meta-llama/Llama-3.2-3B")
+    elif "mistral" in normalized or "mixtral" in normalized:
+        candidates.append("mistralai/Mistral-7B-v0.3")
+    
+    for candidate in candidates:
+        if candidate.lower() in _tokenizer_cache:
+            tokenizer = _tokenizer_cache[candidate.lower()]
+            break
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+            break
+        except Exception:
+            continue
+    
+    _tokenizer_cache[normalized] = tokenizer
+    return tokenizer
+
+
+def count_tokens(text: str, tokenizer) -> int:
+    """Count tokens using the provided tokenizer, falling back to char/4."""
+    if tokenizer is not None:
+        return len(tokenizer.encode(text))
+    return len(text) // 4
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +155,23 @@ def build_prompt(essay_words: int = DEFAULT_ESSAY_WORDS) -> str:
     )
 
 
-def generate_context(target_tokens: int = 30_000) -> str:
+def generate_context(target_tokens: int = 30_000, model_id: str = "") -> str:
+    tokenizer = _get_tokenizer_for_model(model_id) if model_id else None
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f %Z")
     header = f"[UNIQUE TIMESTAMP: {ts}] This section ensures no prompt caching. "
-    target_chars = target_tokens * 4
-    repeats = max(1, (target_chars - len(header)) // len(FILLER))
+    
+    if tokenizer is not None:
+        # Use actual tokenizer to build context close to target token count
+        header_tokens = len(tokenizer.encode(header))
+        filler_tokens = len(tokenizer.encode(FILLER))
+        if filler_tokens > 0:
+            repeats = max(1, (target_tokens - header_tokens) // filler_tokens)
+        else:
+            repeats = max(1, (target_tokens * 4 - len(header)) // len(FILLER))
+    else:
+        # Fallback: char/4 estimation
+        target_chars = target_tokens * 4
+        repeats = max(1, (target_chars - len(header)) // len(FILLER))
     return header + FILLER * repeats
 
 
@@ -111,19 +191,20 @@ def send_request(
     essay_words: int = DEFAULT_ESSAY_WORDS,
 ) -> dict:
     prompt = build_prompt(essay_words)
-    input_tokens = len(f"{context}\n\n{prompt}") // 4
+    tokenizer = _get_tokenizer_for_model(model)
+    input_tokens = count_tokens(f"{context}\n\n{prompt}", tokenizer)
     start = time.monotonic()
 
     try:
         if api_type == "OpenAIResponses":
             result = _send_responses_api(
                 base_url, model, context, api_key, temperature, max_tokens,
-                extra_body, start, prompt
+                extra_body, start, prompt, tokenizer
             )
         else:
             result = _send_completion_api(
                 base_url, model, context, api_key, temperature, max_tokens,
-                extra_body, start, prompt
+                extra_body, start, prompt, tokenizer
             )
     except Exception as e:
         return {"error": str(e)}
@@ -134,7 +215,7 @@ def send_request(
 
 
 def _send_completion_api(
-    base_url, model, context, api_key, temperature, max_tokens, extra_body, start, prompt
+    base_url, model, context, api_key, temperature, max_tokens, extra_body, start, prompt, tokenizer
 ) -> dict:
     """Standard OpenAI /chat/completions with SSE streaming."""
     messages = [{"role": "user", "content": f"{context}\n\n{prompt}"}]
@@ -152,6 +233,8 @@ def _send_completion_api(
     first_tok = None
     last_tok = None
     tok_count = 0
+    chunk_count = 0
+    output_text = ""
     done = False
 
     data = json.dumps(body).encode("utf-8")
@@ -188,7 +271,10 @@ def _send_completion_api(
                     if first_tok is None:
                         first_tok = now
                     last_tok = now
-                    tok_count += max(1, len(content) // 4)
+                    output_text += content
+                    chunk_count += 1
+                    if chunk_count % 50 == 0 or chunk_count == 1:
+                        tok_count = count_tokens(output_text, tokenizer)
                     if tok_count >= max_tokens:
                         done = True
                 elif debug_count < 3:
@@ -202,6 +288,9 @@ def _send_completion_api(
         return {"error": str(e)}
 
     end = time.monotonic()
+    # Final accurate token count
+    if output_text:
+        tok_count = count_tokens(output_text, tokenizer)
     prefill = (first_tok - start) if first_tok else None
     gen = (last_tok - first_tok) if (first_tok and last_tok) else None
     return {
@@ -213,7 +302,7 @@ def _send_completion_api(
 
 
 def _send_responses_api(
-    base_url, model, context, api_key, temperature, max_tokens, extra_body, start, prompt
+    base_url, model, context, api_key, temperature, max_tokens, extra_body, start, prompt, tokenizer
 ) -> dict:
     """OpenAI /responses API with streaming."""
     input_text = f"{context}\n\n{prompt}"
@@ -230,6 +319,8 @@ def _send_responses_api(
     first_tok = None
     last_tok = None
     tok_count = 0
+    chunk_count = 0
+    output_text = ""
     done = False
 
     data = json.dumps(body).encode("utf-8")
@@ -270,7 +361,10 @@ def _send_responses_api(
                         if first_tok is None:
                             first_tok = now
                         last_tok = now
-                        tok_count += max(1, len(text) // 4)
+                        output_text += text
+                        chunk_count += 1
+                        if chunk_count % 50 == 0 or chunk_count == 1:
+                            tok_count = count_tokens(output_text, tokenizer)
                         if tok_count >= max_tokens:
                             done = True
                 elif event_type == "response.text.delta":
@@ -280,7 +374,10 @@ def _send_responses_api(
                         if first_tok is None:
                             first_tok = now
                         last_tok = now
-                        tok_count += max(1, len(text) // 4)
+                        output_text += text
+                        chunk_count += 1
+                        if chunk_count % 50 == 0 or chunk_count == 1:
+                            tok_count = count_tokens(output_text, tokenizer)
                         if tok_count >= max_tokens:
                             done = True
                 elif event_type == "response.output_item.delta":
@@ -290,7 +387,10 @@ def _send_responses_api(
                         if first_tok is None:
                             first_tok = now
                         last_tok = now
-                        tok_count += max(1, len(delta) // 4)
+                        output_text += delta
+                        chunk_count += 1
+                        if chunk_count % 50 == 0 or chunk_count == 1:
+                            tok_count = count_tokens(output_text, tokenizer)
                         if tok_count >= max_tokens:
                             done = True
                     elif isinstance(delta, dict):
@@ -301,7 +401,10 @@ def _send_responses_api(
                                 if first_tok is None:
                                     first_tok = now
                                 last_tok = now
-                                tok_count += max(1, len(v) // 4)
+                                output_text += v
+                                chunk_count += 1
+                                if chunk_count % 50 == 0 or chunk_count == 1:
+                                    tok_count = count_tokens(output_text, tokenizer)
                                 if tok_count >= max_tokens:
                                     done = True
                                 break
@@ -312,6 +415,9 @@ def _send_responses_api(
         return {"error": str(e)}
 
     end = time.monotonic()
+    # Final accurate token count
+    if output_text:
+        tok_count = count_tokens(output_text, tokenizer)
     prefill = (first_tok - start) if first_tok else None
     gen = (last_tok - first_tok) if (first_tok and last_tok) else None
     return {
@@ -605,7 +711,7 @@ def run_ui(stdscr) -> None:
         print(f"\n--- Batch {batch_num}/{num_runs} ({concurrency} concurrent) ---")
         sys.stdout.flush()
 
-        contexts = [generate_context(context_tokens) for _ in range(concurrency)]
+        contexts = [generate_context(context_tokens, model_id) for _ in range(concurrency)]
 
         api_type = selected.get("apiType", "OpenAICompletion")
 
