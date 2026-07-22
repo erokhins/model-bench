@@ -26,9 +26,16 @@ from typing import Optional
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import FloatPrompt, IntPrompt, Prompt
 from rich.table import Table
-from rich.text import Text
+
+from prompt_toolkit import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import Condition
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, Window, HSplit, VSplit
+from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
+from prompt_toolkit.shortcuts import choice as pt_choice
+from prompt_toolkit.styles import Style
 
 try:
     from transformers import AutoTokenizer
@@ -494,41 +501,29 @@ def print_stats(st) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Rich UI
+# Interactive menu (prompt_toolkit)
 # ---------------------------------------------------------------------------
 
 def select_endpoint(configs: list) -> Optional[dict]:
-    """Display a numbered list of endpoints and let the user pick one."""
-    console.print()
-    console.print(Panel("Select an endpoint (number or 'q' to quit)",
-                        style="bold cyan", border_style="cyan"))
-    console.print()
-
-    for i, cfg in enumerate(configs, 1):
+    """Arrow-key navigable endpoint selection using prompt_toolkit choice."""
+    options = []
+    for cfg in configs:
         name = cfg.get("_source_file", "unknown")
         model_id = cfg.get("id", "?")
-        url = cfg.get("baseUrl", "")
         api_type = cfg.get("apiType", "?")
-        console.print(f"  [bold]{i}[/]. [bold]{name}[/]  [{model_id} / {api_type}]")
-        console.print(f"     {url}")
+        label = f"{name}  [{model_id} / {api_type}]"
+        options.append((cfg, label))
 
-    console.print()
-    answer = Prompt.ask("  Select endpoint [1-{}]".format(len(configs)),
-                        default="1")
-    if answer.strip().lower() == "q":
-        return None
-    try:
-        idx = int(answer) - 1
-        if 0 <= idx < len(configs):
-            return configs[idx]
-    except ValueError:
-        pass
-    console.print("[yellow]Invalid selection, using first endpoint.[/]")
-    return configs[0]
+    result = pt_choice(
+        message="Select Endpoint (Esc=quit)",
+        options=options,
+        show_frame=True,
+    )
+    return result
 
 
-def edit_params(selected: dict):
-    """Interactive parameter editor using Rich prompts."""
+def edit_params(selected: dict) -> dict:
+    """Arrow-key navigable parameter editor using prompt_toolkit."""
     model_id = selected.get("id", "")
     base_url = selected.get("baseUrl", "")
     api_key = selected.get("apiKey", os.environ.get("OPENAI_API_KEY", ""))
@@ -540,41 +535,149 @@ def edit_params(selected: dict):
     max_tokens = 4096
     essay_words = DEFAULT_ESSAY_WORDS
 
-    console.print()
-    console.print(Panel("Configure parameters (press Enter to keep default)",
-                        style="bold green", border_style="green"))
-    console.print()
-    console.print(f"  [dim]Endpoint:[/dim] [bold]{model_id}[/]")
-    console.print(f"  [dim]URL:[/dim] [bold]{base_url}[/]")
-    console.print()
+    params = [
+        ("API Key", api_key, str),
+        ("Temperature", temperature, float),
+        ("Concurrency", concurrency, int),
+        ("Batches", num_runs, int),
+        ("Context Tokens", context_tokens, int),
+        ("Max Gen Tokens", max_tokens, int),
+        ("Essay Words", essay_words, int),
+    ]
+    RUN_ACTION = len(params)  # sentinel index for the "Run Load Test" menu item
 
-    # API Key
-    val = Prompt.ask("  API Key", default=api_key)
-    api_key = val if val else api_key
+    sel = [0]
+    run = [False]
+    editing = [False]
 
-    # Temperature
-    val = FloatPrompt.ask("  Temperature", default=temperature)
-    temperature = val
+    style = Style.from_dict({
+        "title": "#00bfff bold",
+        "param_name": "#ffff00",
+        "param_value": "#ffffff",
+        "selected": "#00ff00 bold",
+        "hint": "#888888",
+        "editbar": "#cccccc",
+        "editbar.text": "#ffffff",
+    })
 
-    # Concurrency
-    val = IntPrompt.ask("  Concurrency", default=concurrency)
-    concurrency = val
+    edit_buffer = Buffer()
+    buffer_control = BufferControl(buffer=edit_buffer)
+    edit_label = Window(
+        content=FormattedTextControl(lambda: " Value: " if editing[0] else ""),
+        height=1,
+        width=9,
+        style="class:editbar",
+    )
+    edit_input = Window(
+        content=buffer_control,
+        style="class:editbar",
+        height=1,
+    )
+    edit_window = VSplit([edit_label, edit_input], height=1)
 
-    # Batches
-    val = IntPrompt.ask("  Batches", default=num_runs)
-    num_runs = val
+    name_col_width = max(len(name) for name, _, _ in params) + 1
 
-    # Context Tokens
-    val = IntPrompt.ask("  Context Tokens", default=context_tokens)
-    context_tokens = val
+    def get_lines():
+        lines = []
+        hint = " Editing — Enter=confirm  Esc=cancel" if editing[0] else \
+               " Configuration  (↑↓=navigate  Enter=edit/run  Esc=quit)"
+        lines.append(("class:title", hint + "\n\n"))
+        lines.append(("class:param_name", f" Endpoint: "))
+        lines.append(("class:param_value", f"{model_id}\n"))
+        lines.append(("class:param_name", f" URL:      "))
+        lines.append(("class:param_value", f"{base_url}\n\n"))
+        for i, (name, val, typ) in enumerate(params):
+            if name == "API Key":
+                display = ("*" * 8 + str(val)[-4:]) if len(str(val)) > 4 else "(empty)"
+            elif isinstance(val, int):
+                display = f"{val:,}"
+            else:
+                display = str(val)
+            padded_name = f"{name}:".ljust(name_col_width + 1)
+            marker = ">" if i == sel[0] else " "
+            style = "class:selected" if i == sel[0] else "class:param_name"
+            lines.append((style, f" {marker} {padded_name}"))
+            lines.append(("class:param_value" if i != sel[0] else "class:selected", f" {display}\n"))
+        lines.append(("", "\n"))
+        run_marker = ">" if sel[0] == RUN_ACTION else " "
+        run_style = "class:selected" if sel[0] == RUN_ACTION else "class:hint"
+        lines.append((run_style, f" {run_marker} ▶ Run Load Test\n"))
+        return lines
 
-    # Max Gen Tokens
-    val = IntPrompt.ask("  Max Gen Tokens", default=max_tokens)
-    max_tokens = val
+    top_window = Window(
+        content=FormattedTextControl(get_lines),
+        always_hide_cursor=Condition(lambda: not editing[0]),
+    )
 
-    # Essay Words
-    val = IntPrompt.ask("  Essay Words", default=essay_words)
-    essay_words = val
+    layout = Layout(HSplit([top_window, edit_window]), focused_element=top_window)
+
+    bindings = KeyBindings()
+
+    @bindings.add("up", filter=~Condition(lambda: editing[0]))
+    def go_up(event):
+        sel[0] = (sel[0] - 1) % (len(params) + 1)
+
+    @bindings.add("down", filter=~Condition(lambda: editing[0]))
+    def go_down(event):
+        sel[0] = (sel[0] + 1) % (len(params) + 1)
+
+    @bindings.add("enter", filter=~Condition(lambda: editing[0]))
+    def start_edit(event):
+        if sel[0] == RUN_ACTION:
+            run[0] = True
+            event.app.exit()
+            return
+        name, val, typ = params[sel[0]]
+        if name == "API Key":
+            default = api_key
+        else:
+            default = str(val)
+        edit_buffer.text = default
+        edit_buffer.cursor_position = len(default)
+        editing[0] = True
+        event.app.layout.focus(edit_input)
+
+    @bindings.add("enter", filter=Condition(lambda: editing[0]))
+    def confirm_edit(event):
+        name, val, typ = params[sel[0]]
+        text = edit_buffer.text
+        try:
+            new_val = typ(text)
+            params[sel[0]] = (name, new_val, typ)
+        except (ValueError, TypeError):
+            pass
+        editing[0] = False
+        edit_buffer.text = ""
+        event.app.layout.focus(top_window)
+
+    @bindings.add("escape", filter=Condition(lambda: editing[0]))
+    def cancel_edit(event):
+        editing[0] = False
+        edit_buffer.text = ""
+        event.app.layout.focus(top_window)
+
+    @bindings.add("escape", filter=~Condition(lambda: editing[0]))
+    def quit_app(event):
+        event.app.exit()
+
+    app = Application(
+        layout=layout,
+        key_bindings=bindings,
+        style=style,
+        full_screen=True,
+    )
+    app.run()
+
+    if not run[0]:
+        return None
+
+    api_key = params[0][1]
+    temperature = params[1][1]
+    concurrency = params[2][1]
+    num_runs = params[3][1]
+    context_tokens = params[4][1]
+    max_tokens = params[5][1]
+    essay_words = params[6][1]
 
     return {
         "model_id": model_id,
@@ -677,9 +780,6 @@ def main():
         console.print("Error: this script requires a terminal (tty).")
         sys.exit(1)
 
-    console.print("[bold cyan]OpenAI Chat API Load Test[/]")
-    console.print()
-
     configs = load_model_configs()
     if not configs:
         console.print(f"[yellow]No model configs found in {MODELS_DIR}[/]")
@@ -687,16 +787,10 @@ def main():
 
     selected = select_endpoint(configs)
     if selected is None:
-        console.print("[dim]Quit.[/]")
         sys.exit(0)
 
     params = edit_params(selected)
-
-    # Confirm before running
-    console.print()
-    answer = Prompt.ask("  Run the load test?", choices=["y", "n"], default="y")
-    if answer.strip().lower() == "n":
-        console.print("[dim]Cancelled.[/]")
+    if params is None:
         sys.exit(0)
 
     run_load_test(params)
